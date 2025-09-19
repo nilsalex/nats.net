@@ -71,3 +71,14 @@ public sealed class NatsMaxReconnectRetriesExceededException : NatsException
     {
     }
 }
+
+public sealed class NatsJSConsecutive503Exception : NatsException
+{
+    public NatsJSConsecutive503Exception(int consecutiveErrors)
+        : base($"Received {consecutiveErrors} consecutive 503 'No Responders' errors - consumer may no longer be available")
+    {
+        ConsecutiveErrors = consecutiveErrors;
+    }
+
+    public int ConsecutiveErrors { get; }
+}

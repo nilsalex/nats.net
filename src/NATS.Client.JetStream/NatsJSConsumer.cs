@@ -305,21 +305,22 @@ public class NatsJSConsumer : INatsJSConsumer
         var requestOpts = BuildRequestOpts(opts.MaxMsgs);
 
         var sub = new NatsJSConsume<T>(
-            stream: _stream,
-            consumer: _consumer,
-            context: _context,
-            subject: inbox,
-            queueGroup: default,
-            serializer: serializer,
-            opts: requestOpts,
             maxMsgs: max.MaxMsgs,
-            maxBytes: max.MaxBytes,
             thresholdMsgs: max.ThresholdMsgs,
+            maxBytes: max.MaxBytes,
             thresholdBytes: max.ThresholdBytes,
             expires: timeouts.Expires,
             idle: timeouts.IdleHeartbeat,
+            context: _context,
+            stream: _stream,
+            consumer: _consumer,
+            subject: inbox,
+            queueGroup: default,
             notificationHandler: opts.NotificationHandler,
+            serializer: serializer,
+            opts: requestOpts,
             priorityGroup: opts.PriorityGroup,
+            max503ConsecutiveErrors: opts.Max503ConsecutiveErrors,
             cancellationToken: cancellationToken);
 
         await _context.Connection.AddSubAsync(sub: sub, cancellationToken).ConfigureAwait(false);
