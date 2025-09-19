@@ -63,3 +63,11 @@ public sealed class NatsPayloadTooLargeException : NatsException
     {
     }
 }
+
+public sealed class NatsMaxReconnectRetriesExceededException : NatsException
+{
+    public NatsMaxReconnectRetriesExceededException()
+        : base("Max connect retry exceeded.")
+    {
+    }
+}

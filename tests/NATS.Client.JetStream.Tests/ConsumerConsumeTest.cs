@@ -607,4 +607,85 @@ public class ConsumerConsumeTest
         var pullRequestCount = logger.Logs.Count(m => m.EventId == NatsJSLogEvents.PullRequest);
         pullRequestCount.Should().BeLessThanOrEqualTo(4, "should not flood with pull requests after reconnect");
     }
+
+    [Fact]
+    public async Task ConsumeAsync_stops_when_connection_fails()
+    {
+        await using var server = await NatsServerProcess.StartAsync();
+
+        // Create connection with short retry settings for faster test
+        await using var nats = new NatsConnection(new NatsOpts
+        {
+            Url = server.Url,
+            MaxReconnectRetry = 2,
+            ReconnectWaitMax = TimeSpan.FromMilliseconds(100),
+            ReconnectWaitMin = TimeSpan.FromMilliseconds(50)
+        });
+
+        await nats.ConnectAsync();
+
+        // Create a JetStream context and stream
+        var js = new NatsJSContext(nats);
+        var streamName = "test_stream_" + Guid.NewGuid().ToString("N")[..8];
+
+        await js.CreateStreamAsync(new StreamConfig(streamName, subjects: new[] { $"test.{streamName}.*" }));
+
+        // Create a consumer
+        var consumer = await js.CreateOrUpdateConsumerAsync(streamName, new ConsumerConfig("test_consumer"));
+
+        // Publish a message so consumer has something to work with initially
+        await js.PublishAsync($"test.{streamName}.1", "test message");
+
+        var consumeStartSignal = new WaitSignal(TimeSpan.FromSeconds(10));
+        var consumeEndSignal = new WaitSignal<string>(TimeSpan.FromSeconds(30));
+
+        var consumeTask = Task.Run(async () =>
+        {
+            var messageCount = 0;
+            try
+            {
+                await foreach (var msg in consumer.ConsumeAsync<string>(opts: new NatsJSConsumeOpts
+                {
+                    MaxMsgs = 100,
+                    IdleHeartbeat = TimeSpan.FromSeconds(1) // Short heartbeat for faster failure detection (minimum allowed is 500ms)
+                }))
+                {
+                    messageCount++;
+                    await msg.AckAsync();
+
+                    // Signal we got the first message and consumer is working
+                    if (messageCount == 1)
+                    {
+                        consumeStartSignal.Pulse();
+                    }
+                }
+
+                consumeEndSignal.Pulse("completed_normally");
+                return "completed_normally"; // ConsumeAsync completed normally (should not happen in this test)
+            }
+            catch (Exception ex)
+            {
+                _output.WriteLine($"ConsumeAsync ended with exception: {ex.GetType().Name}: {ex.Message}");
+                consumeEndSignal.Pulse($"exception: {ex.GetType().Name}");
+                return $"exception: {ex.GetType().Name}";
+            }
+        });
+
+        // Wait for the first message to be consumed
+        await consumeStartSignal;
+
+        // Stop the server to trigger reconnect failures
+        await server.StopAsync();
+
+        // Wait for consume to stop due to connection failure
+        var consumeResult = await consumeEndSignal;
+        _output.WriteLine($"ConsumeAsync result: {consumeResult}");
+        _output.WriteLine($"Connection state: {nats.ConnectionState}");
+
+        // Verify that ConsumeAsync stopped (should complete with no more messages available)
+        Assert.True(consumeResult == "completed_normally", $"ConsumeAsync should have completed normally after connection failed, but got: {consumeResult}");
+
+        // Verify connection is in Failed state
+        Assert.Equal(NatsConnectionState.Failed, nats.ConnectionState);
+    }
 }

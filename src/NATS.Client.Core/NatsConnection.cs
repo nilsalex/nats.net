@@ -17,6 +17,7 @@ public enum NatsConnectionState
     Open,
     Connecting,
     Reconnecting,
+    Failed,
 }
 
 internal enum NatsEvent
@@ -741,7 +742,22 @@ public partial class NatsConnection : INatsConnection
                     _logger.LogDebug(NatsLogEvents.Connection, "Reconnect wait with jitter [{ReconnectCount}]", reconnectCount);
                 }
 
-                await WaitWithJitterAsync(_disposedCts.Token).ConfigureAwait(false);
+                try
+                {
+                    await WaitWithJitterAsync(_disposedCts.Token).ConfigureAwait(false);
+                }
+                catch (NatsMaxReconnectRetriesExceededException maxRetriesEx)
+                {
+                    _logger.LogError(NatsLogEvents.Connection, "Max reconnect retries exceeded, connection failed [{ReconnectCount}]", reconnectCount);
+
+                    lock (_gate)
+                    {
+                        ConnectionState = NatsConnectionState.Failed;
+                        _waitForOpenConnection.TrySetException(maxRetriesEx);
+                    }
+
+                    return;
+                }
 
                 if (debug)
                 {
@@ -931,7 +947,7 @@ public partial class NatsConnection : INatsConnection
             throw new NatsException("Won't retry anymore.");
 
         if (Opts.MaxReconnectRetry > 0 && retry > Opts.MaxReconnectRetry)
-            throw new NatsException("Max connect retry exceeded.");
+            throw new NatsMaxReconnectRetriesExceededException();
 
         var jitter = Random.Shared.NextDouble() * Opts.ReconnectJitter.TotalMilliseconds;
         var waitTime = TimeSpan.FromMilliseconds(jitter) + backoff;

@@ -126,6 +126,18 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
                             self._idle);
                     }
                 }
+                else if (self.Connection.ConnectionState == NatsConnectionState.Failed)
+                {
+                    if (self._debug)
+                    {
+                        self._logger.LogDebug(
+                            NatsJSLogEvents.Stopping,
+                            "Connection failed, stopping consume");
+                    }
+
+                    self.CompleteStop();
+                    return;
+                }
             },
             this,
             Timeout.Infinite,
