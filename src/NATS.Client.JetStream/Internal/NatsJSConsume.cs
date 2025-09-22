@@ -39,11 +39,13 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
     private readonly long _thresholdMsgs;
     private readonly long _maxBytes;
     private readonly long _thresholdBytes;
+    private readonly int _max503ConsecutiveErrors;
 
     private readonly object _pendingGate = new();
     private long _pendingMsgs;
     private long _pendingBytes;
     private int _disposed;
+    private int _consecutive503Errors;
 
     public NatsJSConsume(
         long maxMsgs,
@@ -61,6 +63,7 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
         INatsDeserialize<TMsg> serializer,
         NatsSubOpts? opts,
         NatsJSPriorityGroupOpts? priorityGroup,
+        int max503ConsecutiveErrors,
         CancellationToken cancellationToken)
         : base(context.Connection, context.Connection.SubscriptionManager, subject, queueGroup, opts)
     {
@@ -84,6 +87,7 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
         _thresholdBytes = thresholdBytes;
         _expires = expires;
         _idle = idle;
+        _max503ConsecutiveErrors = max503ConsecutiveErrors;
         _hbTimeout = (int)new TimeSpan(idle.Ticks * 2).TotalMilliseconds;
 
         if (_debug)
@@ -125,6 +129,18 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
                             "Idle heartbeat timeout after {Timeout}ns",
                             self._idle);
                     }
+                }
+                else if (self.Connection.ConnectionState == NatsConnectionState.Failed)
+                {
+                    if (self._debug)
+                    {
+                        self._logger.LogDebug(
+                            NatsJSLogEvents.Stopping,
+                            "Connection failed, stopping consume");
+                    }
+
+                    self.CompleteStop();
+                    return;
                 }
             },
             this,
@@ -350,18 +366,46 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
                     }
                     else if (headers.Code == 409 && string.Equals(headers.MessageText, "Leadership Change", StringComparison.OrdinalIgnoreCase))
                     {
+                        // Reset consecutive 503 errors on other errors
+                        Interlocked.Exchange(ref _consecutive503Errors, 0);
+
                         _logger.LogDebug(NatsJSLogEvents.LeadershipChange, "Leadership Change");
                         _notificationChannel?.Notify(NatsJSLeadershipChangeNotification.Default);
                         ResetPending();
                     }
                     else if (headers.Code == 503)
                     {
-                        _logger.LogDebug(NatsJSLogEvents.NoResponders, "503 no responders");
+                        var consecutiveErrors = Interlocked.Increment(ref _consecutive503Errors);
+
+                        if (_max503ConsecutiveErrors > 0 && consecutiveErrors >= _max503ConsecutiveErrors)
+                        {
+                            _logger.LogWarning(
+                                NatsJSLogEvents.NoResponders,
+                                "Received {Count} consecutive 503 errors, consumer may no longer be available, stopping consume",
+                                consecutiveErrors);
+
+                            _userMsgs.Writer.TryComplete(new NatsJSConsecutive503Exception(consecutiveErrors));
+                            EndSubscription(NatsSubEndReason.JetStreamError);
+                            return;
+                        }
+
+                        if (_debug)
+                        {
+                            _logger.LogDebug(
+                                NatsJSLogEvents.NoResponders,
+                                "503 no responders ({Count}/{Max})",
+                                consecutiveErrors,
+                                _max503ConsecutiveErrors);
+                        }
+
                         _notificationChannel?.Notify(NatsJSNoRespondersNotification.Default);
                         ResetPending();
                     }
                     else if (headers.HasTerminalJSError())
                     {
+                        // Reset consecutive 503 errors on terminal errors
+                        Interlocked.Exchange(ref _consecutive503Errors, 0);
+
                         _userMsgs.Writer.TryComplete(new NatsJSProtocolException(headers.Code, headers.Message, headers.MessageText));
                         EndSubscription(NatsSubEndReason.JetStreamError);
                     }
@@ -389,6 +433,9 @@ internal class NatsJSConsume<TMsg> : NatsSubBase
         }
         else
         {
+            // Reset consecutive 503 errors on successful message
+            Interlocked.Exchange(ref _consecutive503Errors, 0);
+
             var msg = new NatsJSMsg<TMsg>(
                 NatsMsg<TMsg>.Build(
                     subject,

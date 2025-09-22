@@ -122,3 +122,7 @@ nuget/*.unitypackage
 /tests/NATS.Client.TestUtilities/Properties/launchSettings.json
 
 /_site
+
+# direnv
+.envrc
+.direnv/

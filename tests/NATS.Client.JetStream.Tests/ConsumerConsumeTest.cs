@@ -607,4 +607,233 @@ public class ConsumerConsumeTest
         var pullRequestCount = logger.Logs.Count(m => m.EventId == NatsJSLogEvents.PullRequest);
         pullRequestCount.Should().BeLessThanOrEqualTo(4, "should not flood with pull requests after reconnect");
     }
+
+    [Fact]
+    public async Task ConsumeAsync_stops_when_connection_fails()
+    {
+        await using var server = await NatsServerProcess.StartAsync();
+
+        // Create connection with short retry settings for faster test
+        await using var nats = new NatsConnection(new NatsOpts
+        {
+            Url = server.Url,
+            MaxReconnectRetry = 2,
+            ReconnectWaitMax = TimeSpan.FromMilliseconds(100),
+            ReconnectWaitMin = TimeSpan.FromMilliseconds(50),
+        });
+
+        await nats.ConnectAsync();
+
+        // Create a JetStream context and stream
+        var js = new NatsJSContext(nats);
+        var streamName = "test_stream_" + Guid.NewGuid().ToString("N")[..8];
+
+        await js.CreateStreamAsync(new StreamConfig(streamName, subjects: new[] { $"test.{streamName}.*" }));
+
+        // Create a consumer
+        var consumer = await js.CreateOrUpdateConsumerAsync(streamName, new ConsumerConfig("test_consumer"));
+
+        // Publish a message so consumer has something to work with initially
+        await js.PublishAsync($"test.{streamName}.1", "test message");
+
+        var consumeStartSignal = new WaitSignal(TimeSpan.FromSeconds(10));
+        var consumeEndSignal = new WaitSignal<string>(TimeSpan.FromSeconds(30));
+
+        var consumeTask = Task.Run(async () =>
+        {
+            var messageCount = 0;
+            try
+            {
+                await foreach (var msg in consumer.ConsumeAsync<string>(opts: new NatsJSConsumeOpts
+                {
+                    MaxMsgs = 100,
+                    IdleHeartbeat = TimeSpan.FromSeconds(1), // Short heartbeat for faster failure detection (minimum allowed is 500ms)
+                }))
+                {
+                    messageCount++;
+                    await msg.AckAsync();
+
+                    // Signal we got the first message and consumer is working
+                    if (messageCount == 1)
+                    {
+                        consumeStartSignal.Pulse();
+                    }
+                }
+
+                consumeEndSignal.Pulse("completed_normally");
+                return "completed_normally"; // ConsumeAsync completed normally (should not happen in this test)
+            }
+            catch (Exception ex)
+            {
+                _output.WriteLine($"ConsumeAsync ended with exception: {ex.GetType().Name}: {ex.Message}");
+                consumeEndSignal.Pulse($"exception: {ex.GetType().Name}");
+                return $"exception: {ex.GetType().Name}";
+            }
+        });
+
+        // Wait for the first message to be consumed
+        await consumeStartSignal;
+
+        // Stop the server to trigger reconnect failures
+        await server.StopAsync();
+
+        // Wait for consume to stop due to connection failure
+        var consumeResult = await consumeEndSignal;
+        _output.WriteLine($"ConsumeAsync result: {consumeResult}");
+        _output.WriteLine($"Connection state: {nats.ConnectionState}");
+
+        // Verify that ConsumeAsync stopped (should complete with no more messages available)
+        Assert.True(consumeResult == "completed_normally", $"ConsumeAsync should have completed normally after connection failed, but got: {consumeResult}");
+
+        // Verify connection is in Failed state
+        Assert.Equal(NatsConnectionState.Failed, nats.ConnectionState);
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_stops_on_consecutive_503_errors()
+    {
+        await using var ms = new MockServer(async (mockServer, cmd) =>
+        {
+            if (cmd.Name == "PUB" && cmd.Subject.Contains("CONSUMER.INFO"))
+            {
+                cmd.Reply(payload: """{"stream_name":"test_stream","name":"test_consumer"}""");
+            }
+            else if (cmd.Name == "PUB" && cmd.Subject.Contains("CONSUMER.MSG.NEXT"))
+            {
+                // Simulate consecutive 503 "No Responders" errors
+                cmd.Reply(headers: "NATS/1.0 503");
+            }
+
+            await Task.CompletedTask;
+        });
+
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var nats = new NatsConnection(new NatsOpts { Url = ms.Url });
+        var js = nats.CreateJetStreamContext();
+        var consumer = await js.GetConsumerAsync("test_stream", "test_consumer", cts.Token);
+
+        var exception = await Assert.ThrowsAsync<NatsJSConsecutive503Exception>(async () =>
+        {
+            await foreach (var msg in consumer.ConsumeAsync<string>(
+                opts: new NatsJSConsumeOpts
+                {
+                    MaxMsgs = 100,
+                    Max503ConsecutiveErrors = 3, // Set low threshold for faster test
+                    IdleHeartbeat = TimeSpan.FromSeconds(1),
+                },
+                cancellationToken: cts.Token))
+            {
+                // This should not execute due to consecutive 503 errors
+            }
+        });
+
+        Assert.Equal(3, exception.ConsecutiveErrors);
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_resets_503_counter_on_successful_message()
+    {
+        await using var server = await NatsServerProcess.StartAsync();
+        await using var nats = new NatsConnection(new NatsOpts { Url = server.Url });
+        await nats.ConnectAsync();
+
+        var js = new NatsJSContext(nats);
+        var streamName = "test_stream_" + Guid.NewGuid().ToString("N")[..8];
+
+        await js.CreateStreamAsync(new StreamConfig(streamName, subjects: new[] { $"test.{streamName}.*" }));
+
+        // Create a durable consumer (will survive restart)
+        var consumer = await js.CreateOrUpdateConsumerAsync(streamName, new ConsumerConfig("test_durable_consumer"));
+
+        // Publish initial message
+        await js.PublishAsync($"test.{streamName}.1", "message 1");
+
+        var messageCount = 0;
+        var consumeTask = Task.Run(async () =>
+        {
+            await foreach (var msg in consumer.ConsumeAsync<string>(opts: new NatsJSConsumeOpts
+            {
+                MaxMsgs = 5,
+                Max503ConsecutiveErrors = 5,
+                IdleHeartbeat = TimeSpan.FromSeconds(1),
+            }))
+            {
+                messageCount++;
+                await msg.AckAsync();
+                _output.WriteLine($"Received message {messageCount}: {msg.Data}");
+
+                if (messageCount == 1)
+                {
+                    // Restart server after first message - this will cause some 503s
+                    await server.RestartAsync();
+                }
+
+                if (messageCount >= 3)
+                {
+                    break; // Exit after receiving a few messages
+                }
+            }
+        });
+
+        // Publish more messages after restart to test counter reset
+        await Task.Delay(2000); // Wait for restart to complete
+        await js.PublishAsync($"test.{streamName}.2", "message 2");
+        await js.PublishAsync($"test.{streamName}.3", "message 3");
+
+        // Wait for consumer task to complete
+        await consumeTask;
+
+        // Verify we received messages after restart (counter was reset)
+        Assert.True(messageCount >= 3, $"Should have received at least 3 messages, but got {messageCount}");
+    }
+
+    [Fact]
+    public async Task ConsumeAsync_disabled_503_tracking_preserves_legacy_behavior()
+    {
+        await using var server = await NatsServerProcess.StartAsync();
+        await using var nats = new NatsConnection(new NatsOpts { Url = server.Url });
+        await nats.ConnectAsync();
+
+        var js = new NatsJSContext(nats);
+        var streamName = "test_stream_" + Guid.NewGuid().ToString("N")[..8];
+
+        await js.CreateStreamAsync(new StreamConfig(streamName, subjects: new[] { $"test.{streamName}.*" }));
+        var consumer = await js.CreateOrUpdateConsumerAsync(streamName, new ConsumerConfig());
+
+        await js.PublishAsync($"test.{streamName}.1", "test message");
+
+        var consumeStartSignal = new WaitSignal(TimeSpan.FromSeconds(10));
+
+        var consumeTask = Task.Run(async () =>
+        {
+            var messageCount = 0;
+            await foreach (var msg in consumer.ConsumeAsync<string>(opts: new NatsJSConsumeOpts
+            {
+                MaxMsgs = 100,
+                Max503ConsecutiveErrors = -1, // Disable 503 tracking
+                IdleHeartbeat = TimeSpan.FromSeconds(1),
+            }))
+            {
+                messageCount++;
+                await msg.AckAsync();
+
+                if (messageCount == 1)
+                {
+                    consumeStartSignal.Pulse();
+                }
+            }
+        });
+
+        // Wait for the first message
+        await consumeStartSignal;
+
+        // Restart server (which deletes ephemeral consumer)
+        await server.RestartAsync();
+
+        // Wait a bit - the consume should continue running (legacy behavior)
+        var completedTask = await Task.WhenAny(consumeTask, Task.Delay(TimeSpan.FromSeconds(5)));
+
+        // Verify consume task did NOT complete (it should continue with 503s)
+        Assert.NotEqual(consumeTask, completedTask);
+    }
 }

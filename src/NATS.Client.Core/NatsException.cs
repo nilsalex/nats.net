@@ -63,3 +63,22 @@ public sealed class NatsPayloadTooLargeException : NatsException
     {
     }
 }
+
+public sealed class NatsMaxReconnectRetriesExceededException : NatsException
+{
+    public NatsMaxReconnectRetriesExceededException()
+        : base("Max connect retry exceeded.")
+    {
+    }
+}
+
+public sealed class NatsJSConsecutive503Exception : NatsException
+{
+    public NatsJSConsecutive503Exception(int consecutiveErrors)
+        : base($"Received {consecutiveErrors} consecutive 503 'No Responders' errors - consumer may no longer be available")
+    {
+        ConsecutiveErrors = consecutiveErrors;
+    }
+
+    public int ConsecutiveErrors { get; }
+}
